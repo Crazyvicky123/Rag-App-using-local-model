@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local RAG Assistant</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside>
+    <h1>Local RAG Assistant</h1>
+    <div class="muted">llama.cpp + FastAPI. Upload docs or code, then ask questions.</div>
+
+    <div class="drop" id="drop">Drop files here or click to upload<br>
+      <span class="muted">.pdf .txt .md .py .js .json …</span></div>
+    <input type="file" id="fileInput" multiple hidden>
+
+    <div class="chips">
+      <span class="chip" id="chipApi"><i></i>API</span>
+      <span class="chip" id="chipLlm"><i></i>Chat LLM</span>
+      <span class="chip" id="chipEmb"><i></i>Embedding</span>
+    </div>
+    <div class="muted" id="status">Checking server…</div>
+    <div class="indexing" id="indexing" hidden>⏳ Indexing documents… questions are paused until it finishes.</div>
+    <ul id="files"></ul>
+    <button id="resetBtn">Clear knowledge base</button>
+  </aside>
+
+  <main>
+    <div id="banner" class="banner" hidden><div class="btext"></div><div class="bar"><span></span></div></div>
+    <div id="chat">
+      <div class="msg"><div class="role">Assistant</div>
+        <p>Hi! Upload some files on the left, then ask me about them.</p></div>
+    </div>
+    <form id="form">
+      <div class="inner">
+        <textarea id="q" rows="2" placeholder="Ask a question… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button class="primary" id="send">Send</button>
+      </div>
+    </form>
+  </main>
+
+<script>
+const $ = id => document.getElementById(id);
+const chat = $("chat"), q = $("q"), sendBtn = $("send");
+
+const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+// Tiny renderer: fenced ``` code blocks -> <pre><code>, everything else -> escaped text.
+function render(text) {
+  return text.split(/```/).map((part, i) => {
+    if (i % 2 === 0) return part.trim() ? `<p>${esc(part.trim())}</p>` : "";
+    const body = part.replace(/^[\w+-]*\n/, "");   // drop the language tag line
+    return `<pre><code>${esc(body.trim())}</code></pre>`;
+  }).join("");
+}
+
+function addMsg(role, html, cls = "") {
+  const d = document.createElement("div");
+  d.className = `msg ${cls}`;
+  d.innerHTML = `<div class="role">${role === "user" ? "You" : "Assistant"}</div>${html}`;
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+  return d;
+}
+
+const setChip = (id, ok) => $(id).className = "chip " + (ok ? "ok" : "bad");
+async function refreshStatus() {
+  try {
+    const r = await (await fetch("/health")).json();
+    $("status").textContent = `${r.chunks_indexed} chunks indexed`;
+    setChip("chipApi", true); setChip("chipLlm", r.llm_server); setChip("chipEmb", r.embed_server);
+  } catch {
+    $("status").textContent = "Cannot reach the FastAPI backend";
+    ["chipApi", "chipLlm", "chipEmb"].forEach(c => setChip(c, false));
+  }
+}
+
+let activeJobs = 0, asking = false;
+function updateSend() {
+  sendBtn.disabled = asking || activeJobs > 0;
+  sendBtn.title = activeJobs > 0 ? "Wait for indexing to finish" : "";
+  $("indexing").hidden = activeJobs === 0;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+const STEP_AT = { uploading: 0, queued: 1, reading: 1, embedding: 2, saving: 3, done: 5 };
+const mmss = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const uploads = new Set();   // live records, one per file: {name, status, p, text, ...}
+
+// Overall progress 0-100: upload 0-10, read 10-15, embed 15-95, save 95-99, done 100.
+function jobProgress(job) {
+  switch (job.status) {
+    case "queued": return 10;
+    case "reading": return 12;
+    case "embedding": return 15 + (job.total ? 80 * job.done / job.total : 0);
+    case "saving": return 97;
+    case "done": return 100;
+    default: return 0;
+  }
+}
+
+function updateBanner() {
+  const act = [...uploads].filter(u => !u.finished);
+  const b = $("banner");
+  b.hidden = act.length === 0;
+  if (!act.length) return;
+  const p = act.reduce((s, u) => s + u.p, 0) / act.length;
+  b.querySelector(".bar span").style.width = p + "%";
+  const u = act[0];
+  b.querySelector(".btext").textContent = act.length === 1
+    ? `⏳ ${u.name}: ${u.text}`
+    : `⏳ Indexing ${act.length} files · ${Math.round(p)}% overall · ${u.name}: ${u.text}`;
+}
+
+function paint(li, rec) {
+  const cur = STEP_AT[rec.status] ?? 0;
+  li.querySelectorAll(".steps li").forEach((s, i) => {
+    s.className = rec.status === "done" || i < cur ? "done" : i === cur ? (rec.failed ? "fail" : "active") : "";
+  });
+  const bar = li.querySelector(".bar");
+  bar.firstElementChild.style.width = rec.p + "%";
+  bar.classList.toggle("pulse", !rec.failed && !rec.finished && !["embedding", "uploading"].includes(rec.status));
+  bar.classList.toggle("failed", !!rec.failed);
+  li.querySelector(".stat").textContent = rec.text;
+  li.querySelector(".msg").textContent = rec.finished ? "" : (rec.msg || "");
+  const w = li.querySelector(".warn");
+  w.hidden = !rec.warn; w.textContent = rec.warn || "";
+  if (rec.log) li.querySelector(".log").textContent = rec.log.join("\n");
+  updateBanner();
+}
+
+function applyJob(rec, job) {
+  const pct = job.total ? Math.round(100 * job.done / job.total) : 0;
+  rec.msg = job.message; rec.log = job.log; rec.warn = "";
+  if (job.status === "error") {          // keep rec.status = the step that was running
+    rec.failed = true; rec.finished = true; rec.text = `❌ ${job.error}`; return;
+  }
+  rec.status = job.status; rec.p = jobProgress(job);
+  if (job.status === "embedding") {
+    const eta = job.done > 0 && job.embed_elapsed
+      ? ` · ~${mmss(job.embed_elapsed / job.done * (job.total - job.done))} left` : "";
+    rec.text = `Embedding ${job.done}/${job.total} chunks (${pct}%) · ${mmss(job.elapsed)} elapsed${eta}`;
+  } else if (job.status === "done") {
+    rec.finished = true; rec.text = `✅ Ready · ${job.total} chunks · took ${mmss(job.elapsed)}`;
+  } else rec.text = job.message;
+  // Stall detection: explain slowness instead of leaving the user guessing.
+  if (!rec.finished && job.idle > 15) {
+    rec.warn = job.batch_running
+      ? `⚠ The embedding server has spent ${Math.round(job.batch_running)}s on one batch. It is still running, just slow (CPU-only or busy). It fails automatically after 3 minutes with no answer. Check the embedding llama-server terminal.`
+      : `⚠ No progress for ${Math.round(job.idle)}s. Check that the backend and llama-server terminals are still running.`;
+  }
+}
+
+// XMLHttpRequest (not fetch) so we get real upload progress events.
+function xhrUpload(file, onPct) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("POST", "/ingest");
+    x.upload.onprogress = e => { if (e.lengthComputable) onPct(Math.round(100 * e.loaded / e.total)); };
+    x.onload = () => {
+      let d = {}; try { d = JSON.parse(x.responseText); } catch {}
+      if (x.status >= 200 && x.status < 300) resolve(d);
+      else reject(new Error(typeof d.detail === "string" ? d.detail : `Upload failed (HTTP ${x.status})`));
+    };
+    x.onerror = () => reject(new Error("Cannot reach the backend (is uvicorn running?)"));
+    const fd = new FormData(); fd.append("file", file); x.send(fd);
+  });
+}
+
+async function uploadOne(f) {
+  const li = document.createElement("li");
+  li.className = "job";
+  li.innerHTML = `<div class="fname"></div>
+    <ol class="steps"><li>Upload</li><li>Read</li><li>Embed</li><li>Save</li><li>Ready</li></ol>
+    <div class="bar"><span></span></div>
+    <div class="stat"></div><div class="msg muted"></div><div class="warn" hidden></div>
+    <details><summary>Details</summary><pre class="log"></pre></details>`;
+  li.querySelector(".fname").textContent = f.name;
+  const rec = { name: f.name, status: "uploading", p: 1, text: "Uploading 0%…", finished: false };
+  uploads.add(rec);
+  $("files").appendChild(li);
+  activeJobs++; updateSend(); paint(li, rec);
+  try {
+    let job = await xhrUpload(f, pct => {
+      rec.p = Math.max(1, pct * 0.1);
+      rec.text = pct < 100 ? `Uploading ${pct}%…` : "Upload complete, waiting for server…";
+      paint(li, rec);
+    });
+    if (!job.id) {   // older backend (app.py) indexes synchronously and returns the result
+      Object.assign(rec, { status: "done", finished: true, p: 100, text: `✅ Ready · ${job.chunks_added ?? "?"} chunks` });
+      paint(li, rec); return;
+    }
+    while (true) {
+      applyJob(rec, job); paint(li, rec);
+      if (job.status === "done" || job.status === "error") break;
+      await sleep(500);
+      let p;
+      try { p = await fetch(`/jobs/${job.id}`); } catch { throw new Error("Lost connection to the backend"); }
+      if (!p.ok) throw new Error("Backend no longer knows this job (was it restarted?)");
+      job = await p.json();
+    }
+  } catch (e) {
+    Object.assign(rec, { failed: true, finished: true, text: `❌ ${e.message}` });
+    paint(li, rec);
+  } finally { rec.finished = true; activeJobs--; updateSend(); updateBanner(); refreshStatus(); }
+}
+function uploadFiles(files) { return Promise.all([...files].map(uploadOne)); }
+
+const drop = $("drop");
+drop.onclick = () => $("fileInput").click();
+$("fileInput").onchange = e => { const fs = [...e.target.files]; e.target.value = ""; uploadFiles(fs); };
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); uploadFiles(e.dataTransfer.files); };
+
+$("resetBtn").onclick = async () => {
+  if (!confirm("Delete all indexed documents?")) return;
+  await fetch("/reset", { method: "POST" });
+  $("files").innerHTML = "";
+  refreshStatus();
+};
+
+async function ask() {
+  const question = q.value.trim();
+  if (!question || asking || activeJobs > 0) return;
+  q.value = ""; asking = true; updateSend();
+  addMsg("user", `<p>${esc(question)}</p>`, "user");
+  const pending = addMsg("assistant", `<p class="muted">Thinking…</p>`);
+  try {
+    const res = await fetch("/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+    const sources = data.sources.map((s, i) =>
+      `<div><b>[${i + 1}] ${esc(s.source || "")}</b> · score ${s.score.toFixed(3)}\n${esc(s.text)}</div>`).join("");
+    pending.innerHTML = `<div class="role">Assistant</div>${render(data.answer)}
+      <details><summary>Sources (${data.sources.length})</summary>${sources}</details>`;
+  } catch (e) {
+    pending.className = "msg error";
+    pending.innerHTML = `<div class="role">Error</div><p>${esc(e.message)}</p>`;
+  }
+  asking = false; updateSend(); q.focus();
+  chat.scrollTop = chat.scrollHeight;
+}
+
+$("form").onsubmit = e => { e.preventDefault(); ask(); };
+q.onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } };
+refreshStatus();
+setInterval(refreshStatus, 4000);
+</script>
+</body>
+</html>
